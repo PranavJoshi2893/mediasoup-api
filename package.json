@@ -1,0 +1,27 @@
+{
+  "name": "mediasoup-api",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc --build",
+    "dev": "tsc --build && node --watch dist/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@types/cors": "^2.8.18",
+    "@types/express": "^5.0.2",
+    "@types/get-port": "^4.0.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "get-port": "^7.1.0",
+    "mediasoup": "^3.15.8",
+    "ws": "^8.18.2"
+  }
+}

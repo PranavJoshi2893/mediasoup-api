@@ -1,0 +1,1 @@
+{"root":["./src/app.ts","./src/index.ts","./src/config/mediasoup.config.ts","./src/lib/launchFfmpeg.ts","./src/lib/worker.ts","./src/lib/ws.ts"],"version":"5.8.3"}
