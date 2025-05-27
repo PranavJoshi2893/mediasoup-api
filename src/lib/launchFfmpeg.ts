@@ -33,15 +33,20 @@ export function launchFfmpeg(
     const ffmpegArgs = [
         "-protocol_whitelist", "file,udp,rtp",
         "-i", sdpPath,
-        "-vf", "fps=15,scale=320:240", // normalize frames
+        "-vf", "fps=15,scale=480:360",        // 15fps, 320x240
         "-c:v", "libx264",
-        "-preset", "slow",
+        "-preset", "ultrafast",
         "-tune", "zerolatency",
+        "-g", "15",                           // 1 keyframe per segment (15fps * 1s)
+        "-keyint_min", "15",
+        "-sc_threshold", "0",
         "-c:a", "aac",
+        "-ar", "48000",
+        "-b:a", "128k",
         "-f", "hls",
-        "-hls_time", "4",
-        "-hls_list_size", "5",
-        "-hls_flags", "delete_segments+append_list",
+        "-hls_time", "1",                     // segment duration (try "0.5" for even lower latency)
+        "-hls_list_size", "3",                // only 3 segments in playlist
+        "-hls_flags", "delete_segments+append_list+program_date_time",
         path.join(hlsDir, "index.m3u8"),
     ];
     // const ffmpegArgs = [

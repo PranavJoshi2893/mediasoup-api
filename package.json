@@ -2,6 +2,7 @@
   "name": "mediasoup-api",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "build": "tsc --build",
     "dev": "tsc --build && node --watch dist/index.js"
@@ -21,7 +22,7 @@
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "get-port": "^7.1.0",
-    "mediasoup": "^3.15.8",
+    "mediasoup": "^3.16.0",
     "ws": "^8.18.2"
   }
 }
