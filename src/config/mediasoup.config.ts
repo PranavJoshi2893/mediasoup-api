@@ -36,7 +36,7 @@ export const config = {
     //   webrtctrasport settings
     webRtcTransport: {
       listenIps: [
-        { ip: "0.0.0.0", announcedIp: "192.168.29.20" },
+        { ip: "127.0.0.1", announcedIp: "127.0.0.1" },
       ] as TransportListenInfo[],
       enableUdp: true,
       enableTcp: true,

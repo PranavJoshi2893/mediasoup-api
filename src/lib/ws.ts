@@ -1,5 +1,4 @@
-import WebSocket, { WebSocketServer } from "ws";
-import { randomUUID } from "crypto";
+import { Server } from "socket.io";
 import { createRouter } from "./worker.js";
 import { config } from "../config/mediasoup.config.js";
 import { launchFfmpeg } from "./launchFfmpeg.js";
@@ -13,10 +12,12 @@ import type {
 } from "mediasoup/types";
 import getPort, { portNumbers } from "get-port";
 
+type MediaKind = "audio" | "video";
+
 // Data structures
-const transports = new Map<string, WebRtcTransport>(); // key: ws.id:channelId
-const channelRouters = new Map<string, Router>(); // key: channelId
-const producers = new Map<string, { audio?: Producer; video?: Producer }>(); // key: channelId
+const transports = new Map<string, WebRtcTransport>();
+const channelRouters = new Map<string, Router>();
+const producers = new Map<string, { audio?: Producer; video?: Producer }>();
 const plainTransports = new Map<
   string,
   { audio: PlainTransport; video: PlainTransport }
@@ -95,9 +96,9 @@ function cleanupChannel(channelId: string) {
   }
 }
 
-function cleanupTransportsForWs(wsId: string) {
+function cleanupTransportsForSocket(socketId: string) {
   for (const [key, transport] of transports) {
-    if (key.startsWith(wsId)) {
+    if (key.startsWith(socketId)) {
       try {
         transport.close();
       } catch {}
@@ -107,184 +108,138 @@ function cleanupTransportsForWs(wsId: string) {
   }
 }
 
-function webSocketConnection(server: WebSocketServer) {
-  server.on("connection", (ws) => {
-    (ws as any).id = randomUUID();
+function socketIoConnection(io: Server) {
+  io.on("connection", (socket) => {
     let channelIdForThisConnection: string | null = null;
 
-    ws.on("message", async (msg) => {
-      console.log("[backend] received:", msg.toString());
-      let event: { type: string; data?: any };
-      try {
-        event = JSON.parse(msg.toString());
-      } catch (err) {
-        console.error(`Invalid JSON:`, err);
+    socket.on("joinRoom", ({ channelId }) => {
+      socket.join(channelId);
+      channelIdForThisConnection = channelId;
+      socket.emit("joinedRoom", { channelId, socketId: socket.id });
+    });
+
+    socket.on("getRouterRtpCapabilities", async ({ channelId }) => {
+      let router = channelRouters.get(channelId);
+      if (!router) {
+        router = await createRouter();
+        channelRouters.set(channelId, router);
+      }
+      socket.emit("routerCapabilities", { data: router.rtpCapabilities });
+    });
+
+    socket.on("createProducerTransport", async ({ channelId }) => {
+      const router = channelRouters.get(channelId);
+      if (!router) {
+        socket.emit("error", { data: "No router for channel" });
         return;
       }
-      const channelId = event.data?.channelId;
-      if (!channelId) {
-        ws.send(JSON.stringify({ type: "error", data: "Missing channelId" }));
+      const key = `${socket.id}:${channelId}`;
+      const transport = await router.createWebRtcTransport({
+        listenIps: config.mediasoup.webRtcTransport.listenIps,
+        enableUdp: config.mediasoup.webRtcTransport.enableUdp,
+        enableTcp: config.mediasoup.webRtcTransport.enableTcp,
+        preferUdp: config.mediasoup.webRtcTransport.preferUdp,
+      });
+      transports.set(key, transport);
+      socket.emit("producerTransportCreated", {
+        data: {
+          id: transport.id,
+          iceParameters: transport.iceParameters,
+          iceCandidates: transport.iceCandidates,
+          dtlsParameters: transport.dtlsParameters,
+        },
+      });
+    });
+
+    socket.on("connectProducerTransport", async (data) => {
+      const channelId = data.channelId;
+      const key = `${socket.id}:${channelId}`;
+      const transport = transports.get(key);
+      if (!transport) {
+        socket.emit("error", { data: "Transport not found" });
         return;
-      }
-      // Store which channel this connection handles (for cleanup)
-      if (!channelIdForThisConnection) {
-        channelIdForThisConnection = channelId;
       }
 
-      switch (event.type) {
-        case "getRouterRtpCapabilities":
-          await handleRouterCapabilities(ws, channelId);
-          break;
-        case "createProducerTransport":
-          await createProducerTransport(ws, channelId);
-          break;
-        case "connectProducerTransport":
-          await connectProducerTransport(ws, event.data);
-          break;
-        case "produce":
-          await handleProduce(ws, event.data, channelId);
-          break;
-        case "stopStream":
-          // Optionally support explicit stop
-          cleanupChannel(channelId);
-          cleanupTransportsForWs((ws as any).id);
-          break;
-        default:
-          console.warn("Unknown message type:", event.type);
-          break;
+      try {
+        await transport.connect({ dtlsParameters: data.dtlsParameters });
+        socket.emit("producerConnected");
+      } catch (err) {
+        socket.emit("error", { data: "connect_transport_failed" });
       }
     });
 
-    ws.on("close", () => {
-      // Cleanup everything related to this ws and its channel!
+    socket.on(
+      "produce",
+      async (data: {
+        channelId: string;
+        kind: MediaKind;
+        rtpParameters: any;
+      }) => {
+        const channelId = data.channelId;
+        const key = `${socket.id}:${channelId}`;
+        const router = channelRouters.get(channelId);
+        const transport = transports.get(key);
+
+        if (!router) {
+          socket.emit("error", { data: "No router for channel" });
+          return;
+        }
+        if (!transport) {
+          socket.emit("error", { data: "Transport not found" });
+          return;
+        }
+
+        try {
+          let prodMap = producers.get(channelId);
+          if (!prodMap) {
+            prodMap = {};
+            producers.set(channelId, prodMap);
+          }
+
+          const producer = await transport.produce({
+            kind: data.kind,
+            rtpParameters: data.rtpParameters,
+          });
+
+          prodMap[data.kind] = producer; // Now this line is safe!
+
+          socket.emit("produced", { id: producer.id });
+          await setupPlainTransportsAndSenders(channelId);
+        } catch (err) {
+          socket.emit("error", { data: "produce_failed" });
+        }
+      }
+    );
+
+    socket.on("stopStream", () => {
       if (channelIdForThisConnection)
         cleanupChannel(channelIdForThisConnection);
-      cleanupTransportsForWs((ws as any).id);
+      cleanupTransportsForSocket(socket.id);
     });
 
-    ws.on("error", (err) => {
-      console.error("WebSocket error:", err);
+    socket.on("disconnect", () => {
+      if (channelIdForThisConnection)
+        cleanupChannel(channelIdForThisConnection);
+      cleanupTransportsForSocket(socket.id);
+    });
+
+    socket.on("error", (err) => {
+      console.error("Socket.IO error:", err);
     });
   });
-}
-
-async function handleRouterCapabilities(ws: WebSocket, channelId: string) {
-  let router = channelRouters.get(channelId);
-  if (!router) {
-    router = await createRouter();
-    channelRouters.set(channelId, router);
-  }
-  ws.send(
-    JSON.stringify({
-      type: "routerCapabilities",
-      data: router.rtpCapabilities,
-    })
-  );
-  console.log(`Sent router RTP capabilities for channelId: ${channelId}`);
-}
-
-async function createProducerTransport(ws: WebSocket, channelId: string) {
-  const router = channelRouters.get(channelId);
-  if (!router) {
-    ws.send(JSON.stringify({ type: "error", data: "No router for channel" }));
-    return;
-  }
-  const key = `${(ws as any).id}:${channelId}`;
-  const transport = await router.createWebRtcTransport({
-    listenIps: config.mediasoup.webRtcTransport.listenIps,
-    enableUdp: config.mediasoup.webRtcTransport.enableUdp,
-    enableTcp: config.mediasoup.webRtcTransport.enableTcp,
-    preferUdp: config.mediasoup.webRtcTransport.preferUdp,
-  });
-  transports.set(key, transport);
-
-  ws.send(
-    JSON.stringify({
-      type: "producerTransportCreated",
-      data: {
-        id: transport.id,
-        iceParameters: transport.iceParameters,
-        iceCandidates: transport.iceCandidates,
-        dtlsParameters: transport.dtlsParameters,
-      },
-    })
-  );
-  console.log(`Producer transport created for key: ${key}`);
-}
-
-async function connectProducerTransport(ws: WebSocket, data: any) {
-  const channelId = data.channelId;
-  const key = `${(ws as any).id}:${channelId}`;
-  const transport = transports.get(key);
-  if (!transport) {
-    ws.send(JSON.stringify({ type: "error", data: "Transport not found" }));
-    return;
-  }
-
-  try {
-    await transport.connect({ dtlsParameters: data.dtlsParameters });
-    console.log(`Producer transport connected for key: ${key}`);
-    ws.send(JSON.stringify({ type: "producerConnected" }));
-  } catch (err) {
-    console.error("Failed to connect transport:", err);
-    ws.send(
-      JSON.stringify({ type: "error", data: "connect_transport_failed" })
-    );
-  }
-}
-
-async function handleProduce(ws: WebSocket, data: any, channelId: string) {
-  const key = `${(ws as any).id}:${channelId}`;
-  const router = channelRouters.get(channelId);
-  const transport = transports.get(key);
-
-  if (!router) {
-    ws.send(JSON.stringify({ type: "error", data: "No router for channel" }));
-    return;
-  }
-  if (!transport) {
-    ws.send(JSON.stringify({ type: "error", data: "Transport not found" }));
-    return;
-  }
-
-  try {
-    const producer = await transport.produce({
-      kind: data.kind,
-      rtpParameters: data.rtpParameters,
-    });
-    // Store producer by kind under the channelId
-    if (!producers.has(channelId)) producers.set(channelId, {});
-    producers.get(channelId)![producer.kind] = producer;
-
-    ws.send(
-      JSON.stringify({
-        type: "produced",
-        data: { id: producer.id },
-      })
-    );
-
-    console.log(
-      `Producer created: ${producer.id} (${producer.kind}) (channelId: ${channelId})`
-    );
-    // When both exist, set up PlainTransport and FFmpeg
-    await setupPlainTransportsAndSenders(channelId);
-  } catch (err) {
-    ws.send(JSON.stringify({ type: "error", data: "produce_failed" }));
-    console.error("Failed to create producer:", err);
-  }
-}
-
-function cloneRtpParameters(original: any) {
-  // Deep clone object (safe for rtpParameters)
-  return JSON.parse(JSON.stringify(original));
-}
-
-function randomSsrc() {
-  // SSRC must be a 32-bit unsigned integer
-  return Math.floor(Math.random() * 0xffffffff);
 }
 
 async function setupPlainTransportsAndSenders(channelId: string) {
+  // Only set up if not already set up for this channel
+  if (
+    plainTransports.has(channelId) &&
+    ffmpegConsumers.has(channelId) &&
+    ffmpegProcesses.has(channelId)
+  ) {
+    // Already set up
+    return;
+  }
+
   const prodMap = producers.get(channelId);
   if (!prodMap?.audio || !prodMap?.video) return;
   const router = channelRouters.get(channelId);
@@ -338,7 +293,6 @@ async function setupPlainTransportsAndSenders(channelId: string) {
     video: videoTransport,
   });
 
-  // ...optional: log transport closure
   audioTransport.on("@close", () => {
     console.log(
       `[mediasoup] PlainTransport (audio) closed for channel ${channelId}`
@@ -355,4 +309,4 @@ async function setupPlainTransportsAndSenders(channelId: string) {
   );
 }
 
-export { webSocketConnection };
+export { socketIoConnection };

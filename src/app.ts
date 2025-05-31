@@ -1,7 +1,7 @@
 import express from "express";
 import * as http from "node:http";
-import { WebSocketServer } from "ws";
-import { webSocketConnection } from "./lib/ws.js";
+import { Server as SocketIOServer } from "socket.io";
+import { socketIoConnection } from "./lib/ws.js";
 import { initializeMediasoupWorkers } from "./lib/worker.js";
 import cors from "cors";
 
@@ -13,9 +13,12 @@ async function main() {
 
   const server = http.createServer(app);
 
-  const websocket = new WebSocketServer({ server, path: "/ws" });
+  const io = new SocketIOServer(server, {
+    path: "/ws",
+    cors: { origin: "*" },
+  });
 
-  webSocketConnection(websocket);
+  socketIoConnection(io);
 
   const PORT = 3001;
   const HOST = "127.0.0.1";
