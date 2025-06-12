@@ -1,304 +1,131 @@
-# Mediasoup SFU + HLS/FFmpeg Signaling Backend
+Absolutely! Here’s a **complete, concise, and modern docstring-style documentation** for your **Mediasoup SFU backend**. This includes:
 
-A robust Node.js/TypeScript backend for real-time, multi-user video/audio rooms built with [Mediasoup](https://mediasoup.org/), supporting **bi-directional conferencing for room participants (SFU)** and **scalable HLS output (via FFmpeg) for external viewers**.
-
----
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-
-   * [High-Level Flow](#high-level-flow)
-   * [Key Components](#key-components)
-   * [Room Lifecycle](#room-lifecycle)
-   * [Producer/Consumer Model](#producerconsumer-model)
-   * [HLS Output Pipeline](#hls-output-pipeline)
-3. [Why Serialization is Critical](#why-serialization-is-critical)
-4. [API/Function Reference](#apifunction-reference)
-
-   * [Room Management](#room-management)
-   * [Mediasoup Transport Management](#mediasoup-transport-management)
-   * [Producer/Consumer Management](#producerconsumer-management)
-   * [HLS/FFmpeg Pipeline Management](#hlsffmpeg-pipeline-management)
-5. [Flow Diagrams](#flow-diagrams)
-6. [Development/Running Locally](#developmentrunning-locally)
-7. [Troubleshooting & FAQs](#troubleshooting--faqs)
-8. [Credits & License](#credits--license)
+1. **High-level explanation** of the backend and the request/response cycle (with event descriptions).
+2. **Why execution order matters** and how your pipeline ensures robustness and reliability.
+3. **Where/how retry logic (e.g., for keyframes) fits in, and why.**
 
 ---
 
-## Overview
+## Documentation: Mediasoup SFU Signaling Backend
 
-This backend implements a multi-user, scalable video conferencing system with two modes of participation:
+### Overview
 
-* **Room Participants:**
-  Any user who joins a room can produce (send) and consume (receive) real-time video/audio via Mediasoup SFU. The system supports *N* producers and *N* consumers per room.
-* **HLS Viewers (External):**
-  All media from active room producers is combined/transcoded by FFmpeg into an HLS (HTTP Live Streaming) stream, accessible to large numbers of viewers with minimal backend load.
-
-**Not a mesh!** This is a **Selective Forwarding Unit (SFU)** model: each user sends media to the server, which routes it to others and also processes it for HLS.
+This module implements a scalable and robust SFU (Selective Forwarding Unit) backend using **Mediasoup** and **Socket.IO**.
+It provides all the signaling and media routing logic needed to create, join, and manage real-time audio/video rooms with support for HLS (HTTP Live Streaming) output.
+The design focuses on **strong type-safety (TypeScript)** and a **strict execution pipeline** for all real-time media and HLS pipeline events.
 
 ---
 
-## Architecture
+### Request/Response Signaling Cycle
 
-### High-Level Flow
+The following events form the backbone of the client-server protocol:
 
-```mermaid
-flowchart LR
-  subgraph Room
-    U1[User 1 (producer/consumer)]
-    U2[User 2 (producer/consumer)]
-    U3[User N (producer/consumer)]
-    Router[Mediasoup Router]
-    FF[FFmpeg/HLS]
-    U1 -->|WebRTC| Router
-    U2 -->|WebRTC| Router
-    U3 -->|WebRTC| Router
-    Router -- A/V RTP --> FF
-  end
+| Event                      | Direction       | Description                                                               | Typical Response             |
+| -------------------------- | --------------- | ------------------------------------------------------------------------- | ---------------------------- |
+| `createRoom`               | Client → Server | Create a new media room.                                                  | `{ roomId }`                 |
+| `joinRoom`                 | Client → Server | Join an existing media room.                                              | `{ roomId }` or error        |
+| `getRouterRtpCapabilities` | Client → Server | Query router RTP capabilities (needed for transport/producers/consumers). | `{ rtpCapabilities }`        |
+| `createProducerTransport`  | Client → Server | Request a new transport for sending media.                                | `{ id, iceParameters, ... }` |
+| `connectProducerTransport` | Client → Server | DTLS handshake for producer transport.                                    | `{ connected: true }`        |
+| `produce`                  | Client → Server | Start sending a media track (audio/video).                                | `{ id: producerId }`         |
+| `stopProducing`            | Client → Server | Stop all sending tracks (audio/video) for this user.                      | `{ stopped: true }`          |
+| `listProducers`            | Client → Server | List all remote producers in this room (for new consumers).               | `{ producers: [...] }`       |
+| `createConsumerTransport`  | Client → Server | Request a transport for receiving media.                                  | `{ id, iceParameters, ... }` |
+| `connectConsumerTransport` | Client → Server | DTLS handshake for consumer transport.                                    | `{ connected: true }`        |
+| `consume`                  | Client → Server | Create a consumer for a remote producer.                                  | Consumer data                |
+| `roomProducersChanged`     | Server → Client | Notify all clients when producers join/leave or tracks change.            | *Event only (no response)*   |
+| `disconnect`               | Client → Server | Client disconnects (clean up).                                            | *Handled internally*         |
 
-  Viewer1[External HLS Viewer]
-  Viewer2[External HLS Viewer]
-  FF -- HLS playlist/files --> Viewer1
-  FF -- HLS playlist/files --> Viewer2
-```
+#### Example Client Flow
 
-#### Key Points:
-
-* Room participants can both produce and consume media, via Mediasoup’s SFU router.
-* External viewers receive a single transcoded HLS stream (from all active participants’ audio + video), generated by FFmpeg.
-
----
-
-### Key Components
-
-* **Mediasoup Router:**
-  Handles all real-time WebRTC traffic per room. Manages WebRtcTransports, Producers (media sources), and Consumers (media sinks).
-* **Socket.IO:**
-  Used for signaling: room join/leave, create transport, produce/consume media, etc.
-* **FFmpeg:**
-  Reads raw RTP from Mediasoup via "plain" transports, composites all AV streams, and generates a live HLS stream (playlist + segments).
-* **Room State Management:**
-  Tracks all users, transports, producers, and the current HLS output state per room.
-* **Serialization Logic:**
-  Ensures the HLS/FFmpeg pipeline is always restarted cleanly and never overlaps, preventing race conditions and resource leaks.
+1. Client emits `createRoom` or `joinRoom`.
+2. Client requests `getRouterRtpCapabilities`.
+3. Client emits `createProducerTransport`, gets transport parameters, performs DTLS handshake via `connectProducerTransport`.
+4. Client emits `produce` with its media track.
+5. Client may emit `listProducers` and then `createConsumerTransport`, `connectConsumerTransport`, and `consume` for each remote producer.
+6. If media state changes (producers leave/join), all users receive a `roomProducersChanged` event and may update their consumers.
 
 ---
 
-### Room Lifecycle
+### Why Maintain Execution Order (Pipeline)?
 
-1. **Create Room:**
-   First user creates a new room; Mediasoup router is created.
-2. **Join Room:**
-   Any number of users can join. Each manages their own WebRTC transports.
-3. **Produce Media:**
-   Any participant can start sending audio and/or video (becoming a "producer").
-4. **Consume Media:**
-   All participants can consume any or all producers in the same room (except their own).
-5. **HLS Pipeline:**
-   Whenever the set of active producers changes, the HLS pipeline is (re)started to reflect the new set.
-6. **Room End/Cleanup:**
-   When all users leave, room and all associated resources are destroyed.
+**The correct execution order is critical for a robust SFU-HLS pipeline**.
+For media and HLS output to work without glitches, resource leaks, or race conditions, each step must be performed in a strict sequence:
 
----
+#### HLS Pipeline Steps
 
-### Producer/Consumer Model
+1. **Cleanup Old State**
+   *Terminate any old FFmpeg processes and close old Mediasoup PlainTransports before allocating new resources. This avoids port conflicts, stale consumers, and resource leaks.*
 
-* Each participant can produce audio and/or video.
-* Each participant can consume media from all other producers in the room.
-* The backend ensures each user only has **at most one audio and one video producer at a time**.
+2. **Allocate Ports**
+   *Assign unique UDP/RTP/RTCP ports for every audio/video pair to guarantee correct stream routing (especially with `rtcpMux: false`).*
 
----
+3. **Create PlainTransports**
+   *Build new Mediasoup PlainTransports for each AV pair, but do not connect them yet.*
 
-### HLS Output Pipeline
+4. **Write SDP File**
+   *Generate and write the new SDP file that FFmpeg will use to understand the new port configuration and stream layout.*
 
-* Whenever at least one user is producing both audio and video, the server:
+5. **Launch FFmpeg**
+   *Start FFmpeg, pointed at the new SDP file, so it is ready to listen on the assigned ports.*
 
-  1. Creates new Mediasoup **plain transports** and **consumers** for each full AV producer.
-  2. Binds those transports to new UDP ports.
-  3. Generates an SDP file listing all AV RTP streams.
-  4. Launches (or restarts) FFmpeg with that SDP, which composites/mixes all inputs and outputs an HLS stream.
-* If no user is producing both audio and video, HLS output is stopped.
+6. **Connect Transports**
+   *Now, connect each PlainTransport to its assigned RTP/RTCP port. If you connect before FFmpeg is listening, packets may be lost, resulting in muted or missing streams.*
 
----
+7. **Create Consumers**
+   *For each producer, create a consumer on the corresponding PlainTransport and request a keyframe (see below).*
 
-## Why Serialization Is Critical
+8. **Save State**
+   *Update internal state with all current pipeline details, so further changes are atomic and robust.*
 
-### Problem
-
-HLS restarts require cleaning up and recreating transports, consumers, FFmpeg, and SDP all together, atomically.
-If two (or more) changes happen back-to-back (user joins/leaves, stops/starts producing), restarts **must not overlap**—or the system could create race conditions, resource leaks, orphaned processes, or black video in the output.
-
-### Solution: Safe Serialization
-
-We use a **serialized, lock-free approach**:
-
-* **Only one HLS pipeline restart runs per room at a time**
-* If any new event requires a restart while one is running, we mark a pending restart to run immediately after the current one finishes
-* This guarantees the system is always consistent, and all changes are eventually processed
-
-### Why Not Just setTimeout?
-
-A naive debounce (e.g., setTimeout) does not guarantee serialization; rapid changes could still overlap and break the pipeline.
-This code uses robust async state tracking for bulletproof reliability.
+> **If these steps are skipped or reordered, you may experience:**
+>
+> * Stuck FFmpeg processes (unable to bind to ports).
+> * Media not flowing (due to unconnected transports or missing SDP).
+> * Stale consumers or zombie Mediasoup transports.
+> * Incomplete HLS output (audio or video missing).
 
 ---
 
-## API/Function Reference
+### Robustness: The Retry Mechanism for Video Keyframes
 
-### Room Management
+**Why do we request keyframes, and why retry?**
 
-#### `handleCreateRoom(socket, cb)`
+* When starting a new video consumer, FFmpeg (and HLS clients) need an *intra-frame* (keyframe) to decode video.
+* If a consumer starts mid-stream, it may wait seconds for the next keyframe, causing visible delay or "black video".
+* Therefore, immediately after consumer creation, the backend requests keyframes via `consumer.requestKeyFrame()`.
+* To ensure delivery, especially in unreliable network conditions, this request is **retried several times** (with short delays) until a keyframe is received.
 
-* Creates a new room, Mediasoup router, initializes state.
-* Responds with the new roomId.
-
-#### `handleJoinRoom(socket, io, { roomId }, cb)`
-
-* Adds a user to an existing room.
-* Emits updated producer list to all room members.
+> **This ensures HLS output starts fast and reliably, with minimal user-perceived latency.**
 
 ---
 
-### Mediasoup Transport Management
+### Summary: Why This Pipeline is Robust
 
-#### `handleCreateTransport(socket, { roomId }, kind, cb)`
-
-* Creates a WebRtcTransport for the given user and kind (`producer` or `consumer`).
-* Responds with ICE and DTLS parameters for client negotiation.
-
-#### `handleConnectTransport(socket, { roomId, dtlsParameters }, kind, cb)`
-
-* Connects an existing transport to complete DTLS handshake.
+* **Strict resource cleanup** prevents leaks and port conflicts.
+* **Atomic state changes** avoid race conditions, even with concurrent join/leave or produce/stop events.
+* **Strict port allocation and SDP writing order** ensures FFmpeg and Mediasoup always agree on stream layout.
+* **Keyframe request retries** guarantee immediate, glitch-free HLS startup.
+* **All signaling events** are request/response and type-safe, minimizing protocol drift and client/server desync.
 
 ---
 
-### Producer/Consumer Management
+## Example: Execution Order in Code
 
-#### `handleProduce(socket, io, { roomId, kind, rtpParameters }, cb)`
-
-* Creates a new producer (audio or video) for the user.
-* Closes any previous producer of that kind.
-* Triggers a (serialized) HLS pipeline restart.
-
-#### `handleStopProducing(socket, { roomId }, cb)`
-
-* Stops all producers for the user.
-* Triggers an HLS pipeline restart.
-
-#### `handleListProducers(socket, { roomId }, cb)`
-
-* Returns all other producers in the room (for client-side consumption).
-
-#### `handleConsume(socket, { roomId, producerId, rtpCapabilities }, cb)`
-
-* Creates a consumer for the given producer and returns all params for client-side setup.
-
----
-
-### HLS/FFmpeg Pipeline Management
-
-#### `safeRestartRoomHls(roomId, room)`
-
-* Public, serialized entrypoint to the HLS restart process.
-* Guarantees only one pipeline restart runs per room at once.
-* Queues a second restart if another change happens mid-restart.
-
-#### `restartRoomHls(roomId, room)`
-
-* Internal, low-level function: tears down and rebuilds all plain transports, consumers, SDP, and FFmpeg processes as needed.
-
-#### `launchFfmpeg(roomId, { audioPorts, videoPorts })`
-
-* Creates the correct SDP file, then spawns FFmpeg to read all RTP streams and produce HLS output.
-
----
-
-## Flow Diagrams
-
-### Core SFU + HLS System
-
-```mermaid
-sequenceDiagram
-    participant A as User A (Producer)
-    participant B as User B (Producer/Consumer)
-    participant S as Signaling Backend
-    participant M as Mediasoup Router
-    participant F as FFmpeg (HLS)
-    participant V as External Viewer
-
-    A->>S: Join Room, Produce (audio+video)
-    B->>S: Join Room, Produce (audio+video)
-    S->>M: Create Transports, Producers
-    S->>M: Create Consumers for all others
-    S->>F: Restart HLS if set of full AV producers changed
-    F->>V: HLS Playlist/Segments
+```typescript
+// In restartRoomHls():
+1. Kill old ffmpeg/transports if present.
+2. Allocate RTP/RTCP ports for all full AV users.
+3. Create PlainTransports for each AV pair.
+4. Write new SDP file for these ports.
+5. Launch ffmpeg with that SDP file.
+6. Connect each PlainTransport to its assigned port (AFTER ffmpeg starts).
+7. Create consumers for each track and request video keyframe with retry.
+8. Save new state.
 ```
 
 ---
 
-## Development/Running Locally
+**By following this pipeline, your Mediasoup SFU/HLS backend is reliable, debuggable, and ready for production.**
 
-### Prerequisites
-
-* Node.js (v18+ recommended)
-* FFmpeg installed and available in `$PATH`
-* [Mediasoup Worker](https://mediasoup.org/documentation/v3/mediasoup/worker/) built
-
-### Getting Started
-
-1. **Install dependencies:**
-
-   ```bash
-   npm install
-   ```
-
-2. **Run the backend:**
-
-   ```bash
-   npm run start
-   ```
-
-3. **Client**: Use your own WebRTC/Mediasoup client or fork [mediasoup-client-demo](https://github.com/versatica/mediasoup-demo) as a starting point.
-
-4. **HLS Output:**
-   HLS segments/playlist are written to `hls/<roomId>/index.m3u8`
-   You can serve this directory over HTTP (e.g., with `serve` or `nginx`) for external viewing.
-
----
-
-## Troubleshooting & FAQs
-
-* **FFmpeg stuck at “Could not find codec parameters for stream (Video: vp8, yuv420p): unspecified size”?**
-
-  * This means FFmpeg hasn’t received a keyframe yet. Double keyframe requests are sent on new video consumers to minimize this risk.
-* **Why are restarts not instant after a participant leaves?**
-
-  * The pipeline is always serialized; if multiple changes happen together, only the final state is used, ensuring clean resources.
-* **Can I support more than two simultaneous producers?**
-
-  * Yes, the code will mix all users who produce both audio and video; FFmpeg layout can be adapted as needed.
-* **Can I use a different video codec?**
-
-  * Update SDP and FFmpeg args in `launchFfmpeg.js` accordingly.
-
----
-
-## Credits & License
-
-* Built with [mediasoup](https://mediasoup.org/), [Socket.IO](https://socket.io/), and [FFmpeg](https://ffmpeg.org/)
-* See LICENSE file for usage terms.
-
----
-
-### Maintainer Notes
-
-**Serialization logic is critical—do not remove or "simplify" unless you understand potential race conditions with async resource teardown and FFmpeg.**
-For advanced scaling, run workers per room and isolate HLS outputs.
-
----
-
-**Feel free to adjust, expand, or subdivide as your project evolves!
-If you want a separate section on how to extend for recording or advanced layouts, let me know!**
+Let me know if you want this as a markdown doc or inline comments in code!
