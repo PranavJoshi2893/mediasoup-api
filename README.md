@@ -115,9 +115,3 @@ For media and HLS output to work without glitches, resource leaks, or race condi
 7. Create consumers for each track and request video keyframe with retry.
 8. Save new state.
 ```
-
----
-
-**By following this pipeline, your Mediasoup SFU/HLS backend is reliable, debuggable, and ready for production.**
-
-Let me know if you want this as a markdown doc or inline comments in code!
