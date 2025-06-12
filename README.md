@@ -1,11 +1,3 @@
-Absolutely! Here’s a **complete, concise, and modern docstring-style documentation** for your **Mediasoup SFU backend**. This includes:
-
-1. **High-level explanation** of the backend and the request/response cycle (with event descriptions).
-2. **Why execution order matters** and how your pipeline ensures robustness and reliability.
-3. **Where/how retry logic (e.g., for keyframes) fits in, and why.**
-
----
-
 ## Documentation: Mediasoup SFU Signaling Backend
 
 ### Overview
